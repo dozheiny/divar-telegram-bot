@@ -7,8 +7,10 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY crontab /etc/cron.d/crontab
-COPY main.py run.sh tokens.json /app/
-RUN chmod 0644 /etc/cron.d/crontab \
+COPY main.py run.sh /app/
+RUN mkdir -p /app/data \
+    && echo '[]' > /app/data/tokens.json \
+    && chmod 0644 /etc/cron.d/crontab \
     && chmod +x /app/run.sh \
     && crontab /etc/cron.d/crontab
 
