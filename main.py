@@ -580,15 +580,22 @@ def main():
     logging.info("Run started at %s", datetime.datetime.now().isoformat())
     tokens = load_tokens()
     first_run = len(tokens) == 0
-    if first_run:
+    seed_only = first_run and SKIP_EXISTING_ON_FIRST_RUN
+    if seed_only:
         logging.info(
-            "Empty tokens.json — seeding without sending (avoids channel spam)"
+            "Empty tokens.json — seeding without sending "
+            "(SKIP_EXISTING_ON_FIRST_RUN=true)"
+        )
+    elif first_run:
+        logging.info(
+            "Empty tokens.json — posting all current listings, "
+            "then only new ads afterwards"
         )
 
     try:
         houses = get_houses_pages()
         logging.info("Fetched %s unique listings", len(houses))
-        tokens = process_data(houses, tokens, seed_only=first_run)
+        tokens = process_data(houses, tokens, seed_only=seed_only)
     except Exception:
         logging.exception("Failed to fetch Divar listings")
 

@@ -62,6 +62,8 @@ Or cron on the host:
 
 ## Notes
 
-- First run only seeds `tokens.json` and does **not** flood the channel with existing ads.
-- New listings are sent with photos (gallery when available) plus a Divar button/link.
+- First run posts **all current** matching ads, then only **new** ones afterwards.
+- To re-send everything once: clear `tokens.json` to `[]` and restart.
+- Set `SKIP_EXISTING_ON_FIRST_RUN=true` if you only want new ads (no initial dump).
+- New listings are sent with photos (gallery when available) plus parking/elevator/storage and description.
 - If Divar CDN blocks downloads from your host, the bot falls back to URL-based Telegram photos, then text-only.
