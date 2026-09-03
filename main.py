@@ -293,13 +293,16 @@ def _bool_label(value):
 
 
 def fetch_post_details(token):
-    """Images, full description, and amenities from the post detail API."""
+    """Images, full description, amenities, and publish time from post detail."""
     details = {
         "images": [],
         "body": "",
         "has_parking": None,
         "has_elevator": None,
         "has_storage": None,
+        "posted_relative": "",
+        "published_at": "",
+        "updated_at": "",
     }
     try:
         response = session.get(
@@ -319,6 +322,21 @@ def fetch_post_details(token):
         for widget in section.get("widgets") or []:
             data = widget.get("data") or {}
             widget_type = widget.get("widget_type")
+
+            if name == "TITLE" and widget_type == "EXPANDABLE_SECTION":
+                # e.g. "پریروز در تهران، تهرانپارس غربی، خ صیادان"
+                details["posted_relative"] = (data.get("title") or "").strip()
+                for nested in data.get("widget_list") or []:
+                    nested_data = nested.get("data") or {}
+                    text = (nested_data.get("text") or "").strip()
+                    if not text:
+                        continue
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if line.startswith("انتشار آگهی"):
+                            details["published_at"] = line
+                        elif line.startswith("آخرین"):
+                            details["updated_at"] = line
 
             if name == "DESCRIPTION" and widget_type == "DESCRIPTION_ROW":
                 text = (data.get("text") or "").strip()
@@ -373,6 +391,9 @@ def extract_house_data(house):
         "district": web_info.get("district_persian")
         or house.get("bottom_description_text")
         or "",
+        "posted_relative": "",
+        "published_at": "",
+        "updated_at": "",
         "has_parking": None,
         "has_elevator": None,
         "has_storage": None,
@@ -386,6 +407,9 @@ def extract_house_data(house):
 def enrich_house_details(house):
     details = fetch_post_details(house["token"])
     house["body"] = details.get("body") or house.get("body") or ""
+    house["posted_relative"] = details.get("posted_relative") or ""
+    house["published_at"] = details.get("published_at") or ""
+    house["updated_at"] = details.get("updated_at") or ""
     house["has_parking"] = details.get("has_parking")
     house["has_elevator"] = details.get("has_elevator")
     house["has_storage"] = details.get("has_storage")
@@ -399,6 +423,9 @@ def build_caption(house, max_len=1024):
     price_info = html.escape(house.get("price_info") or "")
     body = html.escape(house.get("body") or "")
     link = html.escape(house["url"])
+    posted_relative = html.escape(house.get("posted_relative") or "")
+    published_at = html.escape(house.get("published_at") or "")
+    updated_at = html.escape(house.get("updated_at") or "")
 
     amenities = (
         f"پارکینگ: {_bool_label(house.get('has_parking'))}\n"
@@ -406,10 +433,21 @@ def build_caption(house, max_len=1024):
         f"انباری: {_bool_label(house.get('has_storage'))}"
     )
 
+    time_lines = []
+    if posted_relative:
+        time_lines.append(f"<i>{posted_relative}</i>")
+    if published_at:
+        time_lines.append(published_at)
+    if updated_at:
+        time_lines.append(updated_at)
+    time_block = "\n".join(time_lines)
+
     def assemble(body_text):
         parts = [f"<b>{title}</b>"]
         if district:
             parts.append(f"<i>{district}</i>")
+        if time_block:
+            parts.append(time_block)
         if price_info:
             parts.append(price_info)
         parts.append(amenities)
