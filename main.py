@@ -36,12 +36,13 @@ MAX_IMAGES = max(1, min(10, int(os.environ.get("MAX_IMAGES", "4"))))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "5000"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
 # Short timeout for Divar CDN (often blocked outside Iran)
-IMAGE_TIMEOUT = int(os.environ.get("IMAGE_TIMEOUT", "8"))
-# If true, download images and upload to Telegram (better when CDN is reachable)
-UPLOAD_IMAGES = os.environ.get("UPLOAD_IMAGES", "").lower() in (
-    "1",
-    "true",
-    "yes",
+IMAGE_TIMEOUT = int(os.environ.get("IMAGE_TIMEOUT", "15"))
+# Download Divar images and upload to Telegram (needed for full galleries).
+# Default true. Set false only if CDN is unreachable and you want text-only.
+UPLOAD_IMAGES = os.environ.get("UPLOAD_IMAGES", "true").lower() not in (
+    "0",
+    "false",
+    "no",
 )
 
 DIVAR_SEARCH_PAGE = f"https://divar.ir/s/{SEARCH_CONDITIONS}"
@@ -564,7 +565,7 @@ def send_media_group_upload(chat_id, house, downloaded):
     if not media:
         return None
     if len(media) == 1:
-        content, filename = next(iter(files.values()))
+        filename, content = next(iter(files.values()))
         return send_photo_upload(chat_id, house, content, filename)
 
     prepared = {key: (name, BytesIO(blob)) for key, (name, blob) in files.items()}
@@ -608,28 +609,35 @@ def send_telegram_message(house):
     for chat_id in CHAT_IDS:
         ok = None
 
+        # Always try full gallery via download+upload (Telegram cannot reliably
+        # fetch Divar CDN URLs, so remote media groups fail with empty file).
         if image_urls and UPLOAD_IMAGES:
             downloaded = []
             for image_url in image_urls:
                 content, filename = download_image(image_url)
                 if content:
                     downloaded.append((content, filename))
+            logging.info(
+                "Downloaded %s/%s photos for %s",
+                len(downloaded),
+                len(image_urls),
+                house["token"],
+            )
             if len(downloaded) > 1:
                 ok = send_media_group_upload(chat_id, house, downloaded)
             elif len(downloaded) == 1:
                 ok = send_photo_upload(chat_id, house, *downloaded[0])
 
-        elif image_urls and _remote_photos_work is not False:
-            # Telegram often cannot fetch Divar CDN (empty file). Try once, then
-            # remember and use text for the rest of this run.
+        # Last resort: one remote URL photo (often fails outside Iran)
+        if ok is None and image_urls and _remote_photos_work is not False:
             ok = send_photo_by_url(chat_id, house, image_urls[0])
             if ok is not None:
                 _remote_photos_work = True
             else:
                 _remote_photos_work = False
                 logging.info(
-                    "Telegram cannot fetch Divar images; "
-                    "sending text-only for remaining ads this run"
+                    "Remote Divar photo URLs rejected by Telegram; "
+                    "will skip URL photos for the rest of this run"
                 )
 
         if ok is None:
