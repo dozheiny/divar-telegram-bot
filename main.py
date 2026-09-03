@@ -1,4 +1,5 @@
 import datetime
+import fcntl
 import html
 import json
 import logging
@@ -34,6 +35,14 @@ SKIP_EXISTING_ON_FIRST_RUN = os.environ.get(
 MAX_IMAGES = max(1, min(10, int(os.environ.get("MAX_IMAGES", "4"))))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "5000"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
+# Short timeout for Divar CDN (often blocked outside Iran)
+IMAGE_TIMEOUT = int(os.environ.get("IMAGE_TIMEOUT", "8"))
+# If true, download images and upload to Telegram (better when CDN is reachable)
+UPLOAD_IMAGES = os.environ.get("UPLOAD_IMAGES", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 DIVAR_SEARCH_PAGE = f"https://divar.ir/s/{SEARCH_CONDITIONS}"
 DIVAR_POSTLIST_API = "https://api.divar.ir/v8/postlist/w/search"
@@ -72,6 +81,23 @@ def tokens_path():
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), "tokens.json")
 
 
+def lock_path():
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "bot.lock")
+
+
+def acquire_run_lock():
+    """Prevent overlapping cron runs (first dump can take many minutes)."""
+    handle = open(lock_path(), "w", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
 def load_tokens():
     path = tokens_path()
     if not os.path.exists(path):
@@ -91,8 +117,11 @@ def load_tokens():
 def save_tokens(tokens):
     if len(tokens) > MAX_TOKENS:
         tokens = tokens[-MAX_TOKENS:]
-    with open(tokens_path(), "w", encoding="utf-8") as outfile:
+    path = tokens_path()
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as outfile:
         json.dump(tokens, outfile, ensure_ascii=False)
+    os.replace(tmp_path, path)
 
 
 def parse_preloaded_state(html_text):
@@ -394,7 +423,7 @@ def download_image(url):
                 "Referer": "https://divar.ir/",
                 "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             },
-            timeout=REQUEST_TIMEOUT,
+            timeout=IMAGE_TIMEOUT,
         )
         response.raise_for_status()
         content_type = response.headers.get("Content-Type", "")
@@ -464,23 +493,9 @@ def send_text(chat_id, house):
 def send_single_photo(chat_id, house, image_url):
     caption = build_caption(house)
     reply_markup = json.dumps(inline_keyboard(house))
-    content, filename = download_image(image_url)
 
-    if content:
-        result = telegram_request(
-            "sendPhoto",
-            data={
-                "chat_id": chat_id,
-                "caption": caption,
-                "parse_mode": "HTML",
-                "reply_markup": reply_markup,
-            },
-            files={"photo": (filename, BytesIO(content))},
-        )
-        if result is not None:
-            return result
-
-    return telegram_request(
+    # Prefer URL (fast). Upload only when enabled (Iran servers / reachable CDN).
+    result = telegram_request(
         "sendPhoto",
         data={
             "chat_id": chat_id,
@@ -490,13 +505,52 @@ def send_single_photo(chat_id, house, image_url):
             "reply_markup": reply_markup,
         },
     )
+    if result is not None:
+        return result
+
+    if not UPLOAD_IMAGES:
+        return None
+
+    content, filename = download_image(image_url)
+    if not content:
+        return None
+
+    return telegram_request(
+        "sendPhoto",
+        data={
+            "chat_id": chat_id,
+            "caption": caption,
+            "parse_mode": "HTML",
+            "reply_markup": reply_markup,
+        },
+        files={"photo": (filename, BytesIO(content))},
+    )
 
 
 def send_media_group(chat_id, house, image_urls):
     caption = build_caption(house)
+
+    # Fast path: let Telegram fetch URLs (no local CDN downloads).
+    media = []
+    for index, image_url in enumerate(image_urls):
+        item = {"type": "photo", "media": image_url, "parse_mode": "HTML"}
+        if index == 0:
+            item["caption"] = caption
+        media.append(item)
+
+    result = telegram_request(
+        "sendMediaGroup",
+        data={"chat_id": chat_id, "media": json.dumps(media)},
+    )
+    if result is not None:
+        return result
+
+    if not UPLOAD_IMAGES:
+        # Fall back to a single photo URL, then text in caller
+        return send_single_photo(chat_id, house, image_urls[0])
+
     media = []
     files = {}
-
     for index, image_url in enumerate(image_urls):
         content, filename = download_image(image_url)
         item = {"type": "photo", "parse_mode": "HTML"}
@@ -534,10 +588,18 @@ def collect_image_urls(house):
 def send_telegram_message(house):
     if not CHAT_IDS:
         logging.error("BOT_CHATID is empty")
-        return
+        return False
 
     enrich_house_details(house)
     image_urls = collect_image_urls(house)
+    logging.info(
+        "Sending %s (%d image(s)): %s",
+        house["token"],
+        len(image_urls),
+        house["title"][:60],
+    )
+
+    any_ok = False
     for chat_id in CHAT_IDS:
         ok = None
         if len(image_urls) > 1:
@@ -545,10 +607,14 @@ def send_telegram_message(house):
         elif len(image_urls) == 1:
             ok = send_single_photo(chat_id, house, image_urls[0])
         if ok is None:
-            send_text(chat_id, house)
+            ok = send_text(chat_id, house)
+        if ok is not None:
+            any_ok = True
+    return any_ok
 
 
 def process_data(houses, tokens, *, seed_only=False):
+    pending = []
     for house in houses:
         try:
             house_data = extract_house_data(house)
@@ -561,13 +627,25 @@ def process_data(houses, tokens, *, seed_only=False):
             continue
         if any(word in house_data["title"] for word in EXCLUDE_TITLE):
             tokens.append(token)
+            save_tokens(tokens)
             continue
+        pending.append(house_data)
 
+    total = len(pending)
+    if total:
+        logging.info("New listings to process: %s", total)
+
+    for index, house_data in enumerate(pending, start=1):
+        token = house_data["token"]
         tokens.append(token)
+        # Persist immediately so a crash/restart won't re-dump forever
+        save_tokens(tokens)
+
         if seed_only:
             continue
 
         try:
+            logging.info("Posting %s/%s", index, total)
             send_telegram_message(house_data)
             time.sleep(1)
         except Exception as exc:
@@ -581,30 +659,41 @@ def main():
             "BOT_CHATID is required (private id, @channelusername, or -100...)"
         )
 
-    logging.info("Run started at %s", datetime.datetime.now().isoformat())
-    tokens = load_tokens()
-    first_run = len(tokens) == 0
-    seed_only = first_run and SKIP_EXISTING_ON_FIRST_RUN
-    if seed_only:
-        logging.info(
-            "Empty tokens.json — seeding without sending "
-            "(SKIP_EXISTING_ON_FIRST_RUN=true)"
-        )
-    elif first_run:
-        logging.info(
-            "Empty tokens.json — posting all current listings, "
-            "then only new ads afterwards"
-        )
+    lock = acquire_run_lock()
+    if lock is None:
+        logging.info("Another run is in progress; skipping this tick")
+        return
 
     try:
-        houses = get_houses_pages()
-        logging.info("Fetched %s unique listings", len(houses))
-        tokens = process_data(houses, tokens, seed_only=seed_only)
-    except Exception:
-        logging.exception("Failed to fetch Divar listings")
+        logging.info("Run started at %s", datetime.datetime.now().isoformat())
+        tokens = load_tokens()
+        first_run = len(tokens) == 0
+        seed_only = first_run and SKIP_EXISTING_ON_FIRST_RUN
+        if seed_only:
+            logging.info(
+                "Empty tokens.json — seeding without sending "
+                "(SKIP_EXISTING_ON_FIRST_RUN=true)"
+            )
+        elif first_run:
+            logging.info(
+                "Empty tokens.json — posting all current listings, "
+                "then only new ads afterwards"
+            )
 
-    save_tokens(tokens)
-    logging.info("Done. Known tokens: %s", len(tokens))
+        try:
+            houses = get_houses_pages()
+            logging.info("Fetched %s unique listings", len(houses))
+            tokens = process_data(houses, tokens, seed_only=seed_only)
+        except Exception:
+            logging.exception("Failed to fetch Divar listings")
+
+        save_tokens(tokens)
+        logging.info("Done. Known tokens: %s", len(tokens))
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock.close()
 
 
 if __name__ == "__main__":
