@@ -76,6 +76,9 @@ API_HEADERS = {
 session = requests.Session()
 session.headers.update(BROWSER_HEADERS)
 
+# After Telegram rejects Divar CDN URLs once, skip remote photos for this process.
+_remote_photos_work = None
+
 
 def tokens_path():
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), "tokens.json")
@@ -490,85 +493,64 @@ def send_text(chat_id, house):
     )
 
 
-def send_single_photo(chat_id, house, image_url):
-    caption = build_caption(house)
-    reply_markup = json.dumps(inline_keyboard(house))
-
-    # Prefer URL (fast). Upload only when enabled (Iran servers / reachable CDN).
-    result = telegram_request(
-        "sendPhoto",
-        data={
-            "chat_id": chat_id,
-            "photo": image_url,
-            "caption": caption,
-            "parse_mode": "HTML",
-            "reply_markup": reply_markup,
-        },
-    )
-    if result is not None:
-        return result
-
-    if not UPLOAD_IMAGES:
-        return None
-
-    content, filename = download_image(image_url)
-    if not content:
-        return None
-
+def send_photo_by_url(chat_id, house, image_url):
     return telegram_request(
         "sendPhoto",
         data={
             "chat_id": chat_id,
-            "caption": caption,
+            "photo": image_url,
+            "caption": build_caption(house),
             "parse_mode": "HTML",
-            "reply_markup": reply_markup,
+            "reply_markup": json.dumps(inline_keyboard(house)),
         },
-        files={"photo": (filename, BytesIO(content))},
     )
 
 
-def send_media_group(chat_id, house, image_urls):
+def send_photo_upload(chat_id, house, content, filename):
+    if not content:
+        return None
+    return telegram_request(
+        "sendPhoto",
+        data={
+            "chat_id": chat_id,
+            "caption": build_caption(house),
+            "parse_mode": "HTML",
+            "reply_markup": json.dumps(inline_keyboard(house)),
+        },
+        files={"photo": (filename or "photo.jpg", BytesIO(content))},
+    )
+
+
+def send_media_group_upload(chat_id, house, downloaded):
+    """downloaded: list of (content, filename)"""
     caption = build_caption(house)
-
-    # Fast path: let Telegram fetch URLs (no local CDN downloads).
-    media = []
-    for index, image_url in enumerate(image_urls):
-        item = {"type": "photo", "media": image_url, "parse_mode": "HTML"}
-        if index == 0:
-            item["caption"] = caption
-        media.append(item)
-
-    result = telegram_request(
-        "sendMediaGroup",
-        data={"chat_id": chat_id, "media": json.dumps(media)},
-    )
-    if result is not None:
-        return result
-
-    if not UPLOAD_IMAGES:
-        # Fall back to a single photo URL, then text in caller
-        return send_single_photo(chat_id, house, image_urls[0])
-
     media = []
     files = {}
-    for index, image_url in enumerate(image_urls):
-        content, filename = download_image(image_url)
-        item = {"type": "photo", "parse_mode": "HTML"}
-        if index == 0:
+    for index, (content, filename) in enumerate(downloaded):
+        if not content:
+            continue
+        field = f"photo{index}"
+        files[field] = (filename or f"photo{index}.jpg", content)
+        item = {
+            "type": "photo",
+            "media": f"attach://{field}",
+            "parse_mode": "HTML",
+        }
+        if not media:
             item["caption"] = caption
-        if content:
-            field = f"photo{index}"
-            files[field] = (filename or f"photo{index}.jpg", content)
-            item["media"] = f"attach://{field}"
-        else:
-            item["media"] = image_url
         media.append(item)
+
+    if not media:
+        return None
+    if len(media) == 1:
+        content, filename = next(iter(files.values()))
+        return send_photo_upload(chat_id, house, content, filename)
 
     prepared = {key: (name, BytesIO(blob)) for key, (name, blob) in files.items()}
     return telegram_request(
         "sendMediaGroup",
         data={"chat_id": chat_id, "media": json.dumps(media)},
-        files=prepared or None,
+        files=prepared,
     )
 
 
@@ -586,6 +568,8 @@ def collect_image_urls(house):
 
 
 def send_telegram_message(house):
+    global _remote_photos_work
+
     if not CHAT_IDS:
         logging.error("BOT_CHATID is empty")
         return False
@@ -602,14 +586,41 @@ def send_telegram_message(house):
     any_ok = False
     for chat_id in CHAT_IDS:
         ok = None
-        if len(image_urls) > 1:
-            ok = send_media_group(chat_id, house, image_urls)
-        elif len(image_urls) == 1:
-            ok = send_single_photo(chat_id, house, image_urls[0])
+
+        if image_urls and UPLOAD_IMAGES:
+            downloaded = []
+            for image_url in image_urls:
+                content, filename = download_image(image_url)
+                if content:
+                    downloaded.append((content, filename))
+            if len(downloaded) > 1:
+                ok = send_media_group_upload(chat_id, house, downloaded)
+            elif len(downloaded) == 1:
+                ok = send_photo_upload(chat_id, house, *downloaded[0])
+
+        elif image_urls and _remote_photos_work is not False:
+            # Telegram often cannot fetch Divar CDN (empty file). Try once, then
+            # remember and use text for the rest of this run.
+            ok = send_photo_by_url(chat_id, house, image_urls[0])
+            if ok is not None:
+                _remote_photos_work = True
+            else:
+                _remote_photos_work = False
+                logging.info(
+                    "Telegram cannot fetch Divar images; "
+                    "sending text-only for remaining ads this run"
+                )
+
         if ok is None:
             ok = send_text(chat_id, house)
+            if ok is not None:
+                logging.info("Sent text message for %s", house["token"])
+
         if ok is not None:
             any_ok = True
+        else:
+            logging.warning("All send methods failed for %s", house["token"])
+
     return any_ok
 
 
