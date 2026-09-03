@@ -81,11 +81,20 @@ _remote_photos_work = None
 
 
 def tokens_path():
-    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "tokens.json")
+    base = os.path.dirname(os.path.realpath(__file__))
+    data_dir = os.path.join(base, "data")
+    # Prefer ./data when present (compose volume); else legacy path
+    if os.path.isdir(data_dir):
+        return os.path.join(data_dir, "tokens.json")
+    return os.path.join(base, "tokens.json")
 
 
 def lock_path():
-    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "bot.lock")
+    base = os.path.dirname(os.path.realpath(__file__))
+    data_dir = os.path.join(base, "data")
+    if os.path.isdir(data_dir):
+        return os.path.join(data_dir, "bot.lock")
+    return os.path.join(base, "bot.lock")
 
 
 def acquire_run_lock():
@@ -121,10 +130,22 @@ def save_tokens(tokens):
     if len(tokens) > MAX_TOKENS:
         tokens = tokens[-MAX_TOKENS:]
     path = tokens_path()
+    payload = json.dumps(tokens, ensure_ascii=False)
+
+    # Prefer atomic replace, but Podman/Docker file bind-mounts refuse replace
+    # ("Device or resource busy"). Fall back to in-place write.
     tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as outfile:
-        json.dump(tokens, outfile, ensure_ascii=False)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as outfile:
+            outfile.write(payload)
+        os.replace(tmp_path, path)
+    except OSError:
+        with open(path, "w", encoding="utf-8") as outfile:
+            outfile.write(payload)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def parse_preloaded_state(html_text):
