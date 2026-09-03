@@ -27,6 +27,10 @@ EXCLUDE_TITLE = [
     for w in os.environ.get("EXCLUDE_TITLE", "").split(",")
     if w.strip()
 ]
+# If true, first run only remembers current ads and does not post them.
+SKIP_EXISTING_ON_FIRST_RUN = os.environ.get(
+    "SKIP_EXISTING_ON_FIRST_RUN", ""
+).lower() in ("1", "true", "yes")
 MAX_IMAGES = max(1, min(10, int(os.environ.get("MAX_IMAGES", "4"))))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "5000"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))

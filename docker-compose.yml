@@ -7,4 +7,7 @@ services:
       context: .
       dockerfile: ./Dockerfile
     env_file:
-        - ./.env
+      - ./.env
+    volumes:
+      # Persist seen ads on the host (and so `cat tokens.json` matches the bot)
+      - ./tokens.json:/app/tokens.json:Z
