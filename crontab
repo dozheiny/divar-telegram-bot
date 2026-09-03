@@ -1,1 +1,3 @@
-* * * * * cd /app/ && python3 main.py > /proc/1/fd/1 2>/proc/1/fd/2
+PATH=/usr/local/bin:/usr/bin:/bin
+SHELL=/bin/sh
+* * * * * . /app/cron-env.sh; cd /app && /usr/local/bin/python3 main.py > /proc/1/fd/1 2>/proc/1/fd/2
