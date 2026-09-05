@@ -292,6 +292,27 @@ def _bool_label(value):
     return "—"
 
 
+def _group_info_value(items, *title_keys):
+    for item in items:
+        title = item.get("title") or ""
+        if any(key in title for key in title_keys):
+            return (item.get("value") or "").strip()
+    return ""
+
+
+def _is_decorative_photos(title, value, tooltip_text=""):
+    """True when Divar marks listing photos as decorative / not of this unit."""
+    combined = f"{title} {value} {tooltip_text}"
+    if "تزئینی" in combined:
+        return True
+    # "تصویر‌ها برای همین ملک است؟" → "خیر"
+    if ("تصویر" in title or "عکس" in title) and "ملک" in title:
+        normalized = (value or "").strip()
+        if normalized in ("خیر", "نه", "no", "No"):
+            return True
+    return False
+
+
 def fetch_post_details(token):
     """Images, full description, amenities, and publish time from post detail."""
     details = {
@@ -300,6 +321,10 @@ def fetch_post_details(token):
         "has_parking": None,
         "has_elevator": None,
         "has_storage": None,
+        "area": "",
+        "year_built": "",
+        "rooms": "",
+        "decorative_photos": False,
         "posted_relative": "",
         "published_at": "",
         "updated_at": "",
@@ -322,6 +347,7 @@ def fetch_post_details(token):
         for widget in section.get("widgets") or []:
             data = widget.get("data") or {}
             widget_type = widget.get("widget_type")
+            type_name = data.get("@type") or ""
 
             if name == "TITLE" and widget_type == "EXPANDABLE_SECTION":
                 # e.g. "پریروز در تهران، تهرانپارس غربی، خ صیادان"
@@ -344,6 +370,9 @@ def fetch_post_details(token):
                     details["body"] = text
 
             if name == "IMAGE":
+                tooltip = ((data.get("tooltip_data") or {}).get("text") or "")
+                if _is_decorative_photos("", "", tooltip):
+                    details["decorative_photos"] = True
                 for item in data.get("items") or []:
                     image = item.get("image") or {}
                     url = image.get("url")
@@ -353,7 +382,19 @@ def fetch_post_details(token):
                         continue
                     details["images"].append(url)
 
-            if name == "LIST_DATA" and "GroupFeatureRow" in (data.get("@type") or ""):
+            if name == "LIST_DATA" and "GroupInfoRow" in type_name:
+                info_items = data.get("items") or []
+                details["area"] = _group_info_value(info_items, "متراژ")
+                details["year_built"] = _group_info_value(info_items, "ساخت")
+                details["rooms"] = _group_info_value(info_items, "اتاق")
+
+            if name == "LIST_DATA" and widget_type == "UNEXPANDABLE_ROW":
+                row_title = (data.get("title") or "").strip()
+                row_value = (data.get("value") or "").strip()
+                if _is_decorative_photos(row_title, row_value):
+                    details["decorative_photos"] = True
+
+            if name == "LIST_DATA" and "GroupFeatureRow" in type_name:
                 feature_items.extend(data.get("items") or [])
 
     details["images"] = details["images"][:MAX_IMAGES]
@@ -394,6 +435,10 @@ def extract_house_data(house):
         "posted_relative": "",
         "published_at": "",
         "updated_at": "",
+        "area": "",
+        "year_built": "",
+        "rooms": "",
+        "decorative_photos": False,
         "has_parking": None,
         "has_elevator": None,
         "has_storage": None,
@@ -410,6 +455,10 @@ def enrich_house_details(house):
     house["posted_relative"] = details.get("posted_relative") or ""
     house["published_at"] = details.get("published_at") or ""
     house["updated_at"] = details.get("updated_at") or ""
+    house["area"] = details.get("area") or ""
+    house["year_built"] = details.get("year_built") or ""
+    house["rooms"] = details.get("rooms") or ""
+    house["decorative_photos"] = bool(details.get("decorative_photos"))
     house["has_parking"] = details.get("has_parking")
     house["has_elevator"] = details.get("has_elevator")
     house["has_storage"] = details.get("has_storage")
@@ -426,6 +475,18 @@ def build_caption(house, max_len=1024):
     posted_relative = html.escape(house.get("posted_relative") or "")
     published_at = html.escape(house.get("published_at") or "")
     updated_at = html.escape(house.get("updated_at") or "")
+    area = html.escape(house.get("area") or "")
+    year_built = html.escape(house.get("year_built") or "")
+    rooms = html.escape(house.get("rooms") or "")
+
+    facts = []
+    if area:
+        facts.append(f"متراژ: {area}")
+    if year_built:
+        facts.append(f"سال ساخت: {year_built}")
+    if rooms:
+        facts.append(f"اتاق: {rooms}")
+    facts_block = "\n".join(facts)
 
     amenities = (
         f"پارکینگ: {_bool_label(house.get('has_parking'))}\n"
@@ -442,6 +503,10 @@ def build_caption(house, max_len=1024):
         time_lines.append(updated_at)
     time_block = "\n".join(time_lines)
 
+    decorative_note = (
+        "⚠️ عکس ها تزئینی است" if house.get("decorative_photos") else ""
+    )
+
     def assemble(body_text):
         parts = [f"<b>{title}</b>"]
         if district:
@@ -450,7 +515,11 @@ def build_caption(house, max_len=1024):
             parts.append(time_block)
         if price_info:
             parts.append(price_info)
+        if facts_block:
+            parts.append(facts_block)
         parts.append(amenities)
+        if decorative_note:
+            parts.append(decorative_note)
         if body_text:
             parts.append(body_text)
         parts.append(f'<a href="{link}">مشاهده در دیوار</a>')
