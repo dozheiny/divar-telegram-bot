@@ -45,6 +45,9 @@ UPLOAD_IMAGES = os.environ.get("UPLOAD_IMAGES", "true").lower() not in (
     "no",
 )
 
+# Divar's own label for the combined specs/amenities section
+OTHER_FEATURES_TITLE = "سایر ویژگی‌ها و امکانات"
+
 DIVAR_SEARCH_PAGE = f"https://divar.ir/s/{SEARCH_CONDITIONS}"
 DIVAR_POSTLIST_API = "https://api.divar.ir/v8/postlist/w/search"
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -268,28 +271,47 @@ def prefer_full_image_url(url):
     return url.replace("/webp_thumbnail/", "/webp_post/")
 
 
-def _feature_status(items, *, title_keys, icon_names):
-    """Return True/False/None from Divar GroupFeatureRow items."""
-    for item in items:
-        title = item.get("title") or ""
-        icon_name = ((item.get("icon") or {}).get("icon_name") or "").upper()
-        matched = any(key in title for key in title_keys) or icon_name in icon_names
-        if not matched:
+def parse_features_modal(widget_list):
+    """
+    Split Divar's "سایر ویژگی‌ها و امکانات" modal into (specs, amenities).
+
+    specs: [(label, value)] from key/value rows plus label + chip-list pairs
+    (a DESCRIPTION_ROW label whose values arrive in the next WRAPPER_ROW).
+    amenities: Divar's own wording, already negated where it applies
+    (e.g. "آسانسور" vs "آسانسور ندارد").
+    """
+    specs = []
+    amenities = []
+    pending_label = ""
+
+    for widget in widget_list:
+        data = widget.get("data") or {}
+        widget_type = widget.get("widget_type")
+
+        if widget_type == "UNEXPANDABLE_ROW":
+            label = (data.get("title") or "").strip()
+            value = (data.get("value") or "").strip()
+            if label and value:
+                specs.append((label, value))
+        elif widget_type == "FEATURE_ROW":
+            title = (data.get("title") or "").strip()
+            if title:
+                amenities.append(title)
+        elif widget_type == "DESCRIPTION_ROW":
+            pending_label = (data.get("text") or "").strip()
             continue
-        if item.get("available") is True:
-            return True
-        if "ندارد" in title:
-            return False
-        return True
-    return None
+        elif widget_type == "WRAPPER_ROW":
+            chips = [
+                (chip.get("text") or "").strip()
+                for chip in ((data.get("chip_list") or {}).get("chips") or [])
+            ]
+            chips = [chip for chip in chips if chip]
+            if pending_label and chips:
+                specs.append((pending_label, "، ".join(chips)))
 
+        pending_label = ""
 
-def _bool_label(value):
-    if value is True:
-        return "✅"
-    if value is False:
-        return "❌"
-    return "—"
+    return specs, amenities
 
 
 def _group_info_value(items, *title_keys):
@@ -318,12 +340,12 @@ def fetch_post_details(token):
     details = {
         "images": [],
         "body": "",
-        "has_parking": None,
-        "has_elevator": None,
-        "has_storage": None,
+        "feature_specs": [],
+        "amenities": [],
         "area": "",
         "year_built": "",
         "rooms": "",
+        "floor": "",
         "decorative_photos": False,
         "posted_relative": "",
         "published_at": "",
@@ -393,22 +415,38 @@ def fetch_post_details(token):
                 row_value = (data.get("value") or "").strip()
                 if _is_decorative_photos(row_title, row_value):
                     details["decorative_photos"] = True
+                # Exact match: the modal also has "تعداد کل طبقات ساختمان"
+                # and "تعداد واحد در طبقه". Value is "۳" or "۳ از ۴".
+                if row_title == "طبقه" and row_value:
+                    details["floor"] = row_value
+
+            if (
+                name == "LIST_DATA"
+                and widget_type == "SELECTOR_ROW"
+                and (data.get("title") or "").strip() == OTHER_FEATURES_TITLE
+            ):
+                modal_page = (
+                    ((data.get("action") or {}).get("payload") or {}).get("modal_page")
+                    or {}
+                )
+                specs, amenities = parse_features_modal(
+                    modal_page.get("widget_list") or []
+                )
+                details["feature_specs"] = specs
+                details["amenities"] = amenities
 
             if name == "LIST_DATA" and "GroupFeatureRow" in type_name:
                 feature_items.extend(data.get("items") or [])
 
     details["images"] = details["images"][:MAX_IMAGES]
-    details["has_elevator"] = _feature_status(
-        feature_items, title_keys=("آسانسور",), icon_names={"ELEVATOR"}
-    )
-    details["has_parking"] = _feature_status(
-        feature_items, title_keys=("پارکینگ",), icon_names={"PARKING"}
-    )
-    details["has_storage"] = _feature_status(
-        feature_items,
-        title_keys=("انبار",),
-        icon_names={"CABINET", "WAREHOUSE", "STORAGE"},
-    )
+    if not details["amenities"]:
+        # No modal on this listing: the inline GroupFeatureRow carries the same
+        # wording ("آسانسور" / "آسانسور ندارد"), just a shorter list.
+        details["amenities"] = [
+            (item.get("title") or "").strip()
+            for item in feature_items
+            if (item.get("title") or "").strip()
+        ]
     return details
 
 
@@ -438,10 +476,10 @@ def extract_house_data(house):
         "area": "",
         "year_built": "",
         "rooms": "",
+        "floor": "",
         "decorative_photos": False,
-        "has_parking": None,
-        "has_elevator": None,
-        "has_storage": None,
+        "feature_specs": [],
+        "amenities": [],
         "has_image": int(house.get("image_count") or 0) > 0 or bool(image_url),
         "image_url": image_url or None,
         "token": token,
@@ -458,10 +496,10 @@ def enrich_house_details(house):
     house["area"] = details.get("area") or ""
     house["year_built"] = details.get("year_built") or ""
     house["rooms"] = details.get("rooms") or ""
+    house["floor"] = details.get("floor") or ""
     house["decorative_photos"] = bool(details.get("decorative_photos"))
-    house["has_parking"] = details.get("has_parking")
-    house["has_elevator"] = details.get("has_elevator")
-    house["has_storage"] = details.get("has_storage")
+    house["feature_specs"] = details.get("feature_specs") or []
+    house["amenities"] = details.get("amenities") or []
     house["_detail_images"] = details.get("images") or []
     return house
 
@@ -478,6 +516,7 @@ def build_caption(house, max_len=1024):
     area = html.escape(house.get("area") or "")
     year_built = html.escape(house.get("year_built") or "")
     rooms = html.escape(house.get("rooms") or "")
+    floor = html.escape(house.get("floor") or "")
 
     facts = []
     if area:
@@ -486,13 +525,25 @@ def build_caption(house, max_len=1024):
         facts.append(f"سال ساخت: {year_built}")
     if rooms:
         facts.append(f"اتاق: {rooms}")
+    if floor:
+        # Divar gives either "۳" or "۳ از ۴"; pass its wording through as-is.
+        facts.append(f"طبقه: {floor}")
     facts_block = "\n".join(facts)
 
-    amenities = (
-        f"پارکینگ: {_bool_label(house.get('has_parking'))}\n"
-        f"آسانسور: {_bool_label(house.get('has_elevator'))}\n"
-        f"انباری: {_bool_label(house.get('has_storage'))}"
-    )
+    feature_lines = [
+        f"{html.escape(label)}: {html.escape(value)}"
+        for label, value in (house.get("feature_specs") or [])
+    ]
+    amenity_titles = [
+        html.escape(title) for title in (house.get("amenities") or []) if title
+    ]
+    if amenity_titles:
+        feature_lines.append("، ".join(amenity_titles))
+    features_block = ""
+    if feature_lines:
+        features_block = "\n".join(
+            [f"<b>{OTHER_FEATURES_TITLE}</b>"] + feature_lines
+        )
 
     time_lines = []
     if posted_relative:
@@ -507,7 +558,7 @@ def build_caption(house, max_len=1024):
         "⚠️ عکس ها تزئینی است" if house.get("decorative_photos") else ""
     )
 
-    def assemble(body_text):
+    def assemble(body_text, with_features=True):
         parts = [f"<b>{title}</b>"]
         if district:
             parts.append(f"<i>{district}</i>")
@@ -517,7 +568,8 @@ def build_caption(house, max_len=1024):
             parts.append(price_info)
         if facts_block:
             parts.append(facts_block)
-        parts.append(amenities)
+        if with_features and features_block:
+            parts.append(features_block)
         if decorative_note:
             parts.append(decorative_note)
         if body_text:
@@ -529,14 +581,18 @@ def build_caption(house, max_len=1024):
     if len(caption) <= max_len:
         return caption
 
-    # Keep title/price/amenities/link; trim the long description body.
-    base_without_body = assemble("")
-    allowed = max_len - len(base_without_body) - 1
-    if allowed < 32:
-        return base_without_body[:max_len]
+    # Trim the long description body first; only drop the feature list if the
+    # structured part alone still leaves no room. Never slice the assembled
+    # caption — that would cut a closing HTML tag and Telegram rejects it.
+    for with_features in (True, False):
+        base = assemble("", with_features=with_features)
+        # -2 leaves room for the joining newline and the ellipsis.
+        allowed = max_len - len(base) - 2
+        if allowed >= 32:
+            trimmed = body[:allowed].rstrip() + "…"
+            return assemble(trimmed, with_features=with_features)
 
-    trimmed = body[:allowed].rstrip() + "…"
-    return assemble(trimmed)[:max_len]
+    return assemble("", with_features=False)[:max_len]
 
 def inline_keyboard(house):
     return {
